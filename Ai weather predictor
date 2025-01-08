@@ -1,0 +1,239 @@
+from flask import Flask, render_template, request, send_file
+import openmeteo_sdk
+import requests_cache
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from fpdf import FPDF
+from geopy.geocoders import Nominatim
+import requests
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+
+app = Flask(__name__)
+cache_session = requests_cache.CachedSession('.cache', expire_after=180)
+
+# Create necessary directories
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / 'static'
+TEMPLATES_DIR = BASE_DIR / 'templates'
+
+for directory in [STATIC_DIR, TEMPLATES_DIR]:
+    directory.mkdir(exist_ok=True)
+
+# Get location input from user
+def get_location():
+    user_input = input("Enter city name or coordinates (lat, lon) or press Enter to use default (Karachi): ").strip()
+    if user_input == '':
+        city = 'Karachi'
+    else:
+        city = user_input
+    return city
+
+# Convert city name to coordinates using Geopy
+def get_coordinates(city):
+    geolocator = Nominatim(user_agent="weather_predictor")
+    location = geolocator.geocode(city)
+    
+    if location:
+        return location.latitude, location.longitude
+    else:
+        raise ValueError("City not found. Please try again with a valid city name.")
+
+# Fetch historical weather data
+def fetch_weather_data(latitude, longitude, start_date, end_date, variables):
+    print(f"Fetching historical weather data for {latitude}, {longitude}...")
+    print(f"Request parameters: start_date={start_date}, end_date={end_date}, variables={variables}")  # Debugging line
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start_date,
+        "end_date": end_date,
+        "hourly": ",".join(variables),
+        "timezone": "auto"
+    }
+    response = cache_session.get(url, params=params)
+    
+    if response.status_code == 200:
+        return response.json()
+    else:
+        raise Exception(f"Error fetching data: {response.status_code}, Response: {response.text}")  # Include response text for more details
+
+# Data processing and handling missing values
+def process_data(response):
+    hourly_data = response['hourly']
+    data = {
+        "date": pd.to_datetime(hourly_data['time']),
+        "temperature": hourly_data['temperature_2m'],
+        "humidity": hourly_data['relative_humidity_2m'],
+        "wind_speed": hourly_data['wind_speed_10m'],
+    }
+    df = pd.DataFrame(data)
+
+    df['temperature'] = df['temperature'].fillna(method='ffill')
+    df['humidity'] = df['humidity'].fillna(method='ffill')
+    df['wind_speed'] = df['wind_speed'].fillna(method='ffill')
+    
+    return df
+
+# Train the model
+def train_model(df):
+    X = df[["temperature", "humidity", "wind_speed"]]
+    y = df["temperature"]
+    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    model = LinearRegression()
+    model.fit(X_train, y_train)
+    
+    accuracy = model.score(X_test, y_test)
+    print(f"Model accuracy: {accuracy:.2f}")
+    
+    return model, accuracy
+
+# Visualize the data
+def visualize_data(df):
+    plt.figure(figsize=(12, 8))
+    
+    # Create subplots with better spacing
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10))
+    
+    # Temperature plot
+    ax1.plot(df['date'], df['temperature'], label="Temperature (°C)", color='tab:red')
+    ax1.set_xlabel("Date")
+    ax1.set_ylabel("Temperature (°C)")
+    ax1.set_title("Hourly Temperature")
+    ax1.grid(True)
+    ax1.legend()
+
+    # Humidity plot
+    ax2.plot(df['date'], df['humidity'], label="Humidity (%)", color='tab:blue')
+    ax2.set_xlabel("Date")
+    ax2.set_ylabel("Humidity (%)")
+    ax2.set_title("Hourly Humidity")
+    ax2.grid(True)
+    ax2.legend()
+
+    # Wind speed plot
+    ax3.plot(df['date'], df['wind_speed'], label="Wind Speed (km/h)", color='tab:green')
+    ax3.set_xlabel("Date")
+    ax3.set_ylabel("Wind Speed (km/h)")
+    ax3.set_title("Hourly Wind Speed")
+    ax3.grid(True)
+    ax3.legend()
+
+    plt.tight_layout()
+    
+    # Save with proper path
+    viz_path = STATIC_DIR / 'weather_visualizations.png'
+    plt.savefig(viz_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    return viz_path
+
+# Predict the next day's temperature
+def predict_temperature(model, X_test):
+    prediction = model.predict([X_test.iloc[-1]])  # Using the last entry for prediction
+    return prediction[0]
+
+# Save Insights to PDF
+def save_to_pdf(model_accuracy, prediction, city, df, viz_path):
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Arial", size=16, style='B')
+    pdf.cell(200, 10, txt=f"Weather Prediction Insights for {city}", ln=True, align='C')
+
+    # Model accuracy and prediction
+    pdf.ln(10)
+    pdf.set_font("Arial", size=12)
+    pdf.multi_cell(0, 10, f"Model Accuracy: {model_accuracy:.2f}")
+    pdf.multi_cell(0, 10, f"Predicted Temperature for Tomorrow: {prediction:.2f}°C")
+
+    # Statistics
+    pdf.ln(10)
+    pdf.set_font("Arial", size=12, style='B')
+    pdf.multi_cell(0, 10, "Statistical Summary:")
+    pdf.set_font("Arial", size=12)
+    pdf.multi_cell(0, 10, f"Average Temperature: {df['temperature'].mean():.2f}°C")
+    pdf.multi_cell(0, 10, f"Maximum Temperature: {df['temperature'].max():.2f}°C")
+    pdf.multi_cell(0, 10, f"Minimum Temperature: {df['temperature'].min():.2f}°C")
+
+    # Visualizations
+    pdf.ln(10)
+    pdf.multi_cell(0, 10, "Hourly Data Visualizations:")
+    pdf.image(str(viz_path), x=10, w=190)
+
+    # Save PDF with proper path
+    pdf_path = BASE_DIR / 'weather_prediction_insights.pdf'
+    pdf.output(str(pdf_path))
+    return pdf_path
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        try:
+            city = request.form.get('city', 'Karachi').strip()
+            
+            if city == 'Karachi':
+                latitude, longitude = 24.8607, 67.0011
+            else:
+                latitude, longitude = get_coordinates(city)
+            
+            # Use recent historical data
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            start_date = (datetime.now() - timedelta(days=14)).strftime('%Y-%m-%d')
+
+            # Debugging output for dates
+            print(f"Calculated start_date: {start_date}, end_date: {end_date}")
+
+            # Ensure end_date is within the allowed range
+            if end_date > '2025-01-08':
+                end_date = '2025-01-08'
+            if start_date < '1940-01-01':
+                start_date = '1940-01-01'
+
+            # Debugging output after adjustments
+            print(f"Adjusted start_date: {start_date}, end_date: {end_date}")
+
+            variables = ["temperature_2m", "relative_humidity_2m", "wind_speed_10m"]
+
+            response = fetch_weather_data(latitude, longitude, start_date, end_date, variables)
+            df = process_data(response)
+
+            # Visualize the data
+            viz_path = visualize_data(df)
+
+            # Train the model
+            model, model_accuracy = train_model(df)
+
+            # Predict temperature for the next day
+            prediction = predict_temperature(model, df[["temperature", "humidity", "wind_speed"]])
+
+            # Save insights to PDF
+            pdf_path = save_to_pdf(model_accuracy, prediction, city, df, viz_path)
+
+            return render_template('result.html', 
+                                city=city,
+                                accuracy=f"{model_accuracy:.2f}",
+                                prediction=f"{prediction:.2f}")
+
+        except Exception as e:
+            return render_template('index.html', error=str(e))
+
+    return render_template('index.html')
+
+@app.route('/download_pdf')
+def download_pdf():
+    pdf_path = BASE_DIR / 'weather_prediction_insights.pdf'
+    return send_file(pdf_path,
+                    as_attachment=True,
+                    download_name='weather_prediction_insights.pdf')
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
