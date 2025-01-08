@@ -1,0 +1,2 @@
+# projects
+Weather AI predictor
